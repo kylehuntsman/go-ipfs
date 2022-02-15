@@ -1,24 +1,31 @@
 package commands
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"path"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	commands "github.com/ipfs/go-ipfs/commands"
+	"github.com/ipfs/go-ipfs/core"
 	cmdenv "github.com/ipfs/go-ipfs/core/commands/cmdenv"
 	repo "github.com/ipfs/go-ipfs/repo"
 	fsrepo "github.com/ipfs/go-ipfs/repo/fsrepo"
 
 	cmds "github.com/ipfs/go-ipfs-cmds"
 	config "github.com/ipfs/go-ipfs-config"
+	"github.com/libp2p/go-libp2p-core/network"
 	inet "github.com/libp2p/go-libp2p-core/network"
 	peer "github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/protocol"
+	rcmgr "github.com/libp2p/go-libp2p-resource-manager"
 	ma "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
 	mamask "github.com/whyrusleeping/multiaddr-filter"
@@ -52,6 +59,7 @@ ipfs peers in the internet.
 		"filters":    swarmFiltersCmd,
 		"peers":      swarmPeersCmd,
 		"peering":    swarmPeeringCmd,
+		"stats":      swarmStatsCmd,
 	},
 }
 
@@ -302,6 +310,144 @@ var swarmPeersCmd = &cmds.Command{
 		}),
 	},
 	Type: connInfos{},
+}
+
+var swarmStatsCmd = &cmds.Command{
+	Helptext: cmds.HelpText{
+		Tagline: "Report resource usage for a scope.",
+		LongDescription: `Report resource usage for a scope.
+  The scope can be one of the following:
+  - system        -- reports the system aggregate resource usage.
+  - transient     -- reports the transient resource usage.
+  - svc:<service> -- reports the resource usage of a specific service.
+  - proto:<proto> -- reports the resource usage of a specific protocol.
+  - peer:<peer>   -- reports the resource usage of a specific peer.
+  - all           -- reports the resource usage for all currently active scopes.
+`},
+	Arguments: []cmds.Argument{
+		cmds.StringArg("scope", true, false, "scope of the stat report"),
+	},
+	Run: func(req *cmds.Request, res cmds.ResponseEmitter, env cmds.Environment) error {
+		node, err := cmdenv.GetNode(env)
+		if err != nil {
+			return err
+		}
+
+		if len(req.Arguments) != 1 {
+			return fmt.Errorf("must specify exactly one scope")
+		}
+		scope := req.Arguments[0]
+		result, err := NetStat(node, req.Context, scope)
+		if err != nil {
+			return err
+		}
+
+		b := new(bytes.Buffer)
+		enc := json.NewEncoder(b)
+		err = enc.Encode(result)
+		if err != nil {
+			return err
+		}
+		return cmds.EmitOnce(res, b)
+	},
+}
+
+// FIXME(BLOCKING): Move this logic to the API.
+type NetStatOut struct {
+	System    *network.ScopeStat           `json:",omitempty"`
+	Transient *network.ScopeStat           `json:",omitempty"`
+	Services  map[string]network.ScopeStat `json:",omitempty"`
+	Protocols map[string]network.ScopeStat `json:",omitempty"`
+	Peers     map[string]network.ScopeStat `json:",omitempty"`
+}
+
+func NetStat(nd *core.IpfsNode, ctx context.Context, scope string) (NetStatOut, error) {
+	var err error
+	var result NetStatOut
+	switch {
+	case scope == "all":
+		rapi, ok := nd.ResourceManager.(rcmgr.ResourceManagerState)
+		if !ok {
+			return result, fmt.Errorf("resource manager does not support ResourceManagerState API")
+		}
+
+		stat := rapi.Stat()
+		result.System = &stat.System
+		result.Transient = &stat.Transient
+		if len(stat.Services) > 0 {
+			result.Services = stat.Services
+		}
+		if len(stat.Protocols) > 0 {
+			result.Protocols = make(map[string]network.ScopeStat, len(stat.Protocols))
+			for proto, stat := range stat.Protocols {
+				result.Protocols[string(proto)] = stat
+			}
+		}
+		if len(stat.Peers) > 0 {
+			result.Peers = make(map[string]network.ScopeStat, len(stat.Peers))
+			for p, stat := range stat.Peers {
+				result.Peers[p.Pretty()] = stat
+			}
+		}
+
+		return result, nil
+
+	case scope == "system":
+		err = nd.ResourceManager.ViewSystem(func(s network.ResourceScope) error {
+			stat := s.Stat()
+			result.System = &stat
+			return nil
+		})
+		return result, err
+
+	case scope == "transient":
+		err = nd.ResourceManager.ViewTransient(func(s network.ResourceScope) error {
+			stat := s.Stat()
+			result.Transient = &stat
+			return nil
+		})
+		return result, err
+
+	case strings.HasPrefix(scope, "svc:"):
+		svc := scope[4:]
+		err = nd.ResourceManager.ViewService(svc, func(s network.ServiceScope) error {
+			stat := s.Stat()
+			result.Services = map[string]network.ScopeStat{
+				svc: stat,
+			}
+			return nil
+		})
+		return result, err
+
+	case strings.HasPrefix(scope, "proto:"):
+		proto := scope[6:]
+		err = nd.ResourceManager.ViewProtocol(protocol.ID(proto), func(s network.ProtocolScope) error {
+			stat := s.Stat()
+			result.Protocols = map[string]network.ScopeStat{
+				proto: stat,
+			}
+			return nil
+		})
+		return result, err
+
+	case strings.HasPrefix(scope, "peer:"):
+		p := scope[5:]
+		pid, err := peer.IDFromString(p)
+		if err != nil {
+			return result, fmt.Errorf("invalid peer ID: %s: %w", p, err)
+		}
+		err = nd.ResourceManager.ViewPeer(pid, func(s network.PeerScope) error {
+			stat := s.Stat()
+			result.Peers = map[string]network.ScopeStat{
+				p: stat,
+			}
+			return nil
+		})
+		return result, err
+
+	default:
+		return result, fmt.Errorf("invalid scope %s", scope)
+	}
 }
 
 type streamInfo struct {
