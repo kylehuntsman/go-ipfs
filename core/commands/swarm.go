@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"sort"
 	"strings"
@@ -14,7 +15,6 @@ import (
 	"time"
 
 	commands "github.com/ipfs/go-ipfs/commands"
-	"github.com/ipfs/go-ipfs/core"
 	cmdenv "github.com/ipfs/go-ipfs/core/commands/cmdenv"
 	repo "github.com/ipfs/go-ipfs/repo"
 	fsrepo "github.com/ipfs/go-ipfs/repo/fsrepo"
@@ -60,6 +60,7 @@ ipfs peers in the internet.
 		"peers":      swarmPeersCmd,
 		"peering":    swarmPeeringCmd,
 		"stats":      swarmStatsCmd,
+		"limit":      swarmLimitCmd,
 	},
 }
 
@@ -337,7 +338,7 @@ var swarmStatsCmd = &cmds.Command{
 			return fmt.Errorf("must specify exactly one scope")
 		}
 		scope := req.Arguments[0]
-		result, err := NetStat(node, req.Context, scope)
+		result, err := NetStat(node.ResourceManager, req.Context, scope)
 		if err != nil {
 			return err
 		}
@@ -352,7 +353,74 @@ var swarmStatsCmd = &cmds.Command{
 	},
 }
 
-// FIXME(BLOCKING): Move this logic to the API.
+var swarmLimitCmd = &cmds.Command{
+	Helptext: cmds.HelpText{
+		Tagline: "Get or set resource limits for a scope.",
+		LongDescription: `Get or set resource limits for a scope.
+  The scope can be one of the following:
+  - system        -- reports the system aggregate resource usage.
+  - transient     -- reports the transient resource usage.
+  - svc:<service> -- reports the resource usage of a specific service.
+  - proto:<proto> -- reports the resource usage of a specific protocol.
+  - peer:<peer>   -- reports the resource usage of a specific peer.
+ The limit is json-formatted, with the same structure as the limits file.
+`},
+	Arguments: []cmds.Argument{
+		cmds.StringArg("scope", true, false, "scope of the limit"),
+		cmds.StringArg("limit", false, false, "path of the limit configuration file"),
+	},
+	Options: []cmds.Option{
+		cmds.BoolOption("set", "s", "Set the limit for a scope (instead of viewing it).").WithDefault(false),
+	},
+	Run: func(req *cmds.Request, res cmds.ResponseEmitter, env cmds.Environment) error {
+		node, err := cmdenv.GetNode(env)
+		if err != nil {
+			return err
+		}
+
+		setLimit, _ := req.Options["set"].(bool)
+		if setLimit {
+			if len(req.Arguments) != 2 {
+				return fmt.Errorf("must specify exactly a scope and a limit")
+			}
+
+			scope := req.Arguments[0]
+			limitPath := req.Arguments[1]
+			limitStr, err := os.ReadFile(limitPath)
+			if err != nil {
+				return fmt.Errorf("error opening limit JSON file: %w", err)
+			}
+
+			var limit NetLimitConfig
+			err = json.Unmarshal([]byte(limitStr), &limit)
+			if err != nil {
+				return fmt.Errorf("error decoding limit: %w", err)
+			}
+
+			return NetSetLimit(node.ResourceManager, req.Context, scope, limit)
+		}
+
+		if len(req.Arguments) != 1 {
+			return fmt.Errorf("must specify exactly one scope")
+		}
+		scope := req.Arguments[0]
+		result, err := NetLimit(node.ResourceManager, req.Context, scope)
+		if err != nil {
+			return err
+		}
+
+		b := new(bytes.Buffer)
+		enc := json.NewEncoder(b)
+		err = enc.Encode(result)
+		if err != nil {
+			return err
+		}
+		return cmds.EmitOnce(res, b)
+	},
+}
+
+// FIXME(BLOCKING): Decide where to move the net stat/limit logic and types.
+
 type NetStatOut struct {
 	System    *network.ScopeStat           `json:",omitempty"`
 	Transient *network.ScopeStat           `json:",omitempty"`
@@ -361,12 +429,26 @@ type NetStatOut struct {
 	Peers     map[string]network.ScopeStat `json:",omitempty"`
 }
 
-func NetStat(nd *core.IpfsNode, ctx context.Context, scope string) (NetStatOut, error) {
+type NetLimitConfig struct {
+	Dynamic bool `json:",omitempty"`
+	// set if Dynamic is false
+	Memory int64 `json:",omitempty"`
+	// set if Dynamic is true
+	MemoryFraction float64 `json:",omitempty"`
+	MinMemory      int64   `json:",omitempty"`
+	MaxMemory      int64   `json:",omitempty"`
+
+	Streams, StreamsInbound, StreamsOutbound int
+	Conns, ConnsInbound, ConnsOutbound       int
+	FD                                       int
+}
+
+func NetStat(mgr network.ResourceManager, ctx context.Context, scope string) (NetStatOut, error) {
 	var err error
 	var result NetStatOut
 	switch {
 	case scope == "all":
-		rapi, ok := nd.ResourceManager.(rcmgr.ResourceManagerState)
+		rapi, ok := mgr.(rcmgr.ResourceManagerState)
 		if !ok {
 			return result, fmt.Errorf("resource manager does not support ResourceManagerState API")
 		}
@@ -393,7 +475,7 @@ func NetStat(nd *core.IpfsNode, ctx context.Context, scope string) (NetStatOut, 
 		return result, nil
 
 	case scope == "system":
-		err = nd.ResourceManager.ViewSystem(func(s network.ResourceScope) error {
+		err = mgr.ViewSystem(func(s network.ResourceScope) error {
 			stat := s.Stat()
 			result.System = &stat
 			return nil
@@ -401,7 +483,7 @@ func NetStat(nd *core.IpfsNode, ctx context.Context, scope string) (NetStatOut, 
 		return result, err
 
 	case scope == "transient":
-		err = nd.ResourceManager.ViewTransient(func(s network.ResourceScope) error {
+		err = mgr.ViewTransient(func(s network.ResourceScope) error {
 			stat := s.Stat()
 			result.Transient = &stat
 			return nil
@@ -410,7 +492,7 @@ func NetStat(nd *core.IpfsNode, ctx context.Context, scope string) (NetStatOut, 
 
 	case strings.HasPrefix(scope, "svc:"):
 		svc := scope[4:]
-		err = nd.ResourceManager.ViewService(svc, func(s network.ServiceScope) error {
+		err = mgr.ViewService(svc, func(s network.ServiceScope) error {
 			stat := s.Stat()
 			result.Services = map[string]network.ScopeStat{
 				svc: stat,
@@ -421,7 +503,7 @@ func NetStat(nd *core.IpfsNode, ctx context.Context, scope string) (NetStatOut, 
 
 	case strings.HasPrefix(scope, "proto:"):
 		proto := scope[6:]
-		err = nd.ResourceManager.ViewProtocol(protocol.ID(proto), func(s network.ProtocolScope) error {
+		err = mgr.ViewProtocol(protocol.ID(proto), func(s network.ProtocolScope) error {
 			stat := s.Stat()
 			result.Protocols = map[string]network.ScopeStat{
 				proto: stat,
@@ -436,7 +518,7 @@ func NetStat(nd *core.IpfsNode, ctx context.Context, scope string) (NetStatOut, 
 		if err != nil {
 			return result, fmt.Errorf("invalid peer ID: %s: %w", p, err)
 		}
-		err = nd.ResourceManager.ViewPeer(pid, func(s network.PeerScope) error {
+		err = mgr.ViewPeer(pid, func(s network.PeerScope) error {
 			stat := s.Stat()
 			result.Peers = map[string]network.ScopeStat{
 				p: stat,
@@ -447,6 +529,176 @@ func NetStat(nd *core.IpfsNode, ctx context.Context, scope string) (NetStatOut, 
 
 	default:
 		return result, fmt.Errorf("invalid scope %s", scope)
+	}
+}
+
+func NetLimit(mgr network.ResourceManager, ctx context.Context, scope string) (NetLimitConfig, error) {
+	var result NetLimitConfig
+	getLimit := func(s network.ResourceScope) error {
+		limiter, ok := s.(rcmgr.ResourceScopeLimiter)
+		if !ok {
+			return fmt.Errorf("resource scope doesn't implement ResourceScopeLimiter interface")
+		}
+
+		limit := limiter.Limit()
+		switch l := limit.(type) {
+		case *rcmgr.StaticLimit:
+			result.Memory = l.Memory
+			result.Streams = l.BaseLimit.Streams
+			result.StreamsInbound = l.BaseLimit.StreamsInbound
+			result.StreamsOutbound = l.BaseLimit.StreamsOutbound
+			result.Conns = l.BaseLimit.Conns
+			result.ConnsInbound = l.BaseLimit.ConnsInbound
+			result.ConnsOutbound = l.BaseLimit.ConnsOutbound
+			result.FD = l.BaseLimit.FD
+
+		case *rcmgr.DynamicLimit:
+			result.Dynamic = true
+			result.MemoryFraction = l.MemoryLimit.MemoryFraction
+			result.MinMemory = l.MemoryLimit.MinMemory
+			result.MaxMemory = l.MemoryLimit.MaxMemory
+			result.Streams = l.BaseLimit.Streams
+			result.StreamsInbound = l.BaseLimit.StreamsInbound
+			result.StreamsOutbound = l.BaseLimit.StreamsOutbound
+			result.Conns = l.BaseLimit.Conns
+			result.ConnsInbound = l.BaseLimit.ConnsInbound
+			result.ConnsOutbound = l.BaseLimit.ConnsOutbound
+			result.FD = l.BaseLimit.FD
+
+		default:
+			return fmt.Errorf("unknown limit type %T", limit)
+		}
+
+		return nil
+	}
+
+	switch {
+	case scope == "system":
+		err := mgr.ViewSystem(func(s network.ResourceScope) error {
+			return getLimit(s)
+		})
+		return result, err
+
+	case scope == "transient":
+		err := mgr.ViewTransient(func(s network.ResourceScope) error {
+			return getLimit(s)
+		})
+		return result, err
+
+	case strings.HasPrefix(scope, "svc:"):
+		svc := scope[4:]
+		err := mgr.ViewService(svc, func(s network.ServiceScope) error {
+			return getLimit(s)
+		})
+		return result, err
+
+	case strings.HasPrefix(scope, "proto:"):
+		proto := scope[6:]
+		err := mgr.ViewProtocol(protocol.ID(proto), func(s network.ProtocolScope) error {
+			return getLimit(s)
+		})
+		return result, err
+
+	case strings.HasPrefix(scope, "peer:"):
+		p := scope[5:]
+		pid, err := peer.IDFromString(p)
+		if err != nil {
+			return result, fmt.Errorf("invalid peer ID: %s: %w", p, err)
+		}
+		err = mgr.ViewPeer(pid, func(s network.PeerScope) error {
+			return getLimit(s)
+		})
+		return result, err
+
+	default:
+		return result, fmt.Errorf("invalid scope %s", scope)
+	}
+}
+
+func NetSetLimit(mgr network.ResourceManager, ctx context.Context, scope string, limit NetLimitConfig) error {
+	setLimit := func(s network.ResourceScope) error {
+		limiter, ok := s.(rcmgr.ResourceScopeLimiter)
+		if !ok {
+			return fmt.Errorf("resource scope doesn't implement ResourceScopeLimiter interface")
+		}
+
+		var newLimit rcmgr.Limit
+		if limit.Dynamic {
+			newLimit = &rcmgr.DynamicLimit{
+				MemoryLimit: rcmgr.MemoryLimit{
+					MemoryFraction: limit.MemoryFraction,
+					MinMemory:      limit.MinMemory,
+					MaxMemory:      limit.MaxMemory,
+				},
+				BaseLimit: rcmgr.BaseLimit{
+					Streams:         limit.Streams,
+					StreamsInbound:  limit.StreamsInbound,
+					StreamsOutbound: limit.StreamsOutbound,
+					Conns:           limit.Conns,
+					ConnsInbound:    limit.ConnsInbound,
+					ConnsOutbound:   limit.ConnsOutbound,
+					FD:              limit.FD,
+				},
+			}
+		} else {
+			newLimit = &rcmgr.StaticLimit{
+				Memory: limit.Memory,
+				BaseLimit: rcmgr.BaseLimit{
+					Streams:         limit.Streams,
+					StreamsInbound:  limit.StreamsInbound,
+					StreamsOutbound: limit.StreamsOutbound,
+					Conns:           limit.Conns,
+					ConnsInbound:    limit.ConnsInbound,
+					ConnsOutbound:   limit.ConnsOutbound,
+					FD:              limit.FD,
+				},
+			}
+		}
+
+		limiter.SetLimit(newLimit)
+		return nil
+	}
+
+	switch {
+	case scope == "system":
+		err := mgr.ViewSystem(func(s network.ResourceScope) error {
+			return setLimit(s)
+		})
+		return err
+
+	case scope == "transient":
+		err := mgr.ViewTransient(func(s network.ResourceScope) error {
+			return setLimit(s)
+		})
+		return err
+
+	case strings.HasPrefix(scope, "svc:"):
+		svc := scope[4:]
+		err := mgr.ViewService(svc, func(s network.ServiceScope) error {
+			return setLimit(s)
+		})
+		return err
+
+	case strings.HasPrefix(scope, "proto:"):
+		proto := scope[6:]
+		err := mgr.ViewProtocol(protocol.ID(proto), func(s network.ProtocolScope) error {
+			return setLimit(s)
+		})
+		return err
+
+	case strings.HasPrefix(scope, "peer:"):
+		p := scope[5:]
+		pid, err := peer.IDFromString(p)
+		if err != nil {
+			return fmt.Errorf("invalid peer ID: %s: %w", p, err)
+		}
+		err = mgr.ViewPeer(pid, func(s network.PeerScope) error {
+			return setLimit(s)
+		})
+		return err
+
+	default:
+		return fmt.Errorf("invalid scope %s", scope)
 	}
 }
 
