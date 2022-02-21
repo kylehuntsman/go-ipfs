@@ -14,16 +14,16 @@ import (
 	"sync"
 	"time"
 
-	commands "github.com/ipfs/go-ipfs/commands"
-	cmdenv "github.com/ipfs/go-ipfs/core/commands/cmdenv"
-	repo "github.com/ipfs/go-ipfs/repo"
-	fsrepo "github.com/ipfs/go-ipfs/repo/fsrepo"
+	"github.com/ipfs/go-ipfs/commands"
+	"github.com/ipfs/go-ipfs/core/commands/cmdenv"
+	"github.com/ipfs/go-ipfs/repo"
+	"github.com/ipfs/go-ipfs/repo/fsrepo"
 
 	cmds "github.com/ipfs/go-ipfs-cmds"
 	config "github.com/ipfs/go-ipfs-config"
 	"github.com/libp2p/go-libp2p-core/network"
 	inet "github.com/libp2p/go-libp2p-core/network"
-	peer "github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/protocol"
 	rcmgr "github.com/libp2p/go-libp2p-resource-manager"
 	ma "github.com/multiformats/go-multiaddr"
@@ -514,7 +514,7 @@ func NetStat(mgr network.ResourceManager, ctx context.Context, scope string) (Ne
 
 	case strings.HasPrefix(scope, "peer:"):
 		p := scope[5:]
-		pid, err := peer.IDFromString(p)
+		pid, err := peer.Decode(p)
 		if err != nil {
 			return result, fmt.Errorf("invalid peer ID: %s: %w", p, err)
 		}
@@ -601,7 +601,7 @@ func NetLimit(mgr network.ResourceManager, ctx context.Context, scope string) (N
 
 	case strings.HasPrefix(scope, "peer:"):
 		p := scope[5:]
-		pid, err := peer.IDFromString(p)
+		pid, err := peer.Decode(p)
 		if err != nil {
 			return result, fmt.Errorf("invalid peer ID: %s: %w", p, err)
 		}
@@ -688,7 +688,7 @@ func NetSetLimit(mgr network.ResourceManager, ctx context.Context, scope string,
 
 	case strings.HasPrefix(scope, "peer:"):
 		p := scope[5:]
-		pid, err := peer.IDFromString(p)
+		pid, err := peer.Decode(p)
 		if err != nil {
 			return fmt.Errorf("invalid peer ID: %s: %w", p, err)
 		}
