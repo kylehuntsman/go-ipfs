@@ -334,6 +334,10 @@ var swarmStatsCmd = &cmds.Command{
 			return err
 		}
 
+		if node.ResourceManager == nil {
+			return fmt.Errorf("no resource manager available, make sure the daemon is running")
+		}
+
 		if len(req.Arguments) != 1 {
 			return fmt.Errorf("must specify exactly one scope")
 		}
@@ -376,6 +380,10 @@ var swarmLimitCmd = &cmds.Command{
 		node, err := cmdenv.GetNode(env)
 		if err != nil {
 			return err
+		}
+
+		if node.ResourceManager == nil {
+			return fmt.Errorf("no resource manager available, make sure the daemon is running")
 		}
 
 		setLimit, _ := req.Options["set"].(bool)
