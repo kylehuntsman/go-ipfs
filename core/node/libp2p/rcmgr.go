@@ -2,16 +2,12 @@ package libp2p
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/ipfs/go-ipfs/repo"
-	"github.com/libp2p/go-libp2p-core/network"
-	"go.uber.org/fx"
-	"os"
-	"path/filepath"
-
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p-core/network"
 	rcmgr "github.com/libp2p/go-libp2p-resource-manager"
+	"go.uber.org/fx"
 )
 
 func ResourceManager() func(fx.Lifecycle, repo.Repo) (network.ResourceManager, Libp2pOpts, error) {
@@ -19,21 +15,9 @@ func ResourceManager() func(fx.Lifecycle, repo.Repo) (network.ResourceManager, L
 		var limiter *rcmgr.BasicLimiter
 		var opts Libp2pOpts
 
-		// FIXME(BLOCKING): Get repo path.
-		// repo.Path()
-		limitsIn, err := os.Open(filepath.Join(".", "limits.json"))
-		switch {
-		case err == nil:
-			defer limitsIn.Close()
-			limiter, err = rcmgr.NewDefaultLimiterFromJSON(limitsIn)
-			if err != nil {
-				return nil, opts, fmt.Errorf("error parsing limit file: %w", err)
-			}
-		case errors.Is(err, os.ErrNotExist):
-			limiter = rcmgr.NewDefaultLimiter()
-		default:
-			return nil, opts, err
-		}
+		// FIXME(BLOCKING): Decide how is the `limit.json` file path going to be consumed,
+		//  either by default in the repo root or through the `go-ipfs-config`.
+		limiter = rcmgr.NewDefaultLimiter()
 
 		libp2p.SetDefaultServiceLimits(limiter)
 

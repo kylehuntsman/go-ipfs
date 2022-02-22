@@ -11,7 +11,6 @@ package core
 
 import (
 	"context"
-	"github.com/libp2p/go-libp2p-core/network"
 	"io"
 
 	"github.com/ipfs/go-filestore"
@@ -31,6 +30,7 @@ import (
 	ic "github.com/libp2p/go-libp2p-core/crypto"
 	p2phost "github.com/libp2p/go-libp2p-core/host"
 	metrics "github.com/libp2p/go-libp2p-core/metrics"
+	"github.com/libp2p/go-libp2p-core/network"
 	peer "github.com/libp2p/go-libp2p-core/peer"
 	pstore "github.com/libp2p/go-libp2p-core/peerstore"
 	routing "github.com/libp2p/go-libp2p-core/routing"
